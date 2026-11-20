@@ -1,8 +1,8 @@
 {
   "id": "dsh-community/dsh-provider-power-switch",
-  "version": "0.1.6",
+  "version": "0.3.0",
   "main": "./src/index.js",
-  "description": "供应商级模型开关：在「设置 → 模型开关」分节给每个模型供应商一个启用/停用开关，关闭后立即拦截发往该供应商的请求（不消耗配额），一键全部开启/关闭。",
+  "description": "按供应商分组的模型开关：在「设置 → 模型开关」分节给每个模型一行启用/停用开关，支持搜索与整组开关。",
   "engines": {
     "dsh": ">=0.2.0-rc.2 <0.3.0"
   },

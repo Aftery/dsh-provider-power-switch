@@ -21,9 +21,12 @@ const fakeRemote = {
   async $mount(desc) { return async () => {} },
   'dsh-provider-power-switch': {
     async snapshot() { return { disabled: [] } },
-    async listProviders() { return { providers: ['openrouter', 'deepseek-official', 'qoder'] } },
-    async setProvider(p, off) { return { disabled: off ? [p] : [] } },
-    async setAll(ps, off) { return { disabled: off ? ps : [] } },
+    async listModels() { return { groups: [
+      { provider: 'magpie-anthropic', displayName: 'Magpie · Anthropic', models: [{ id: 'claude-opus-5.5', name: 'Claude Opus 5.5' }] },
+    ] } },
+    async setModel(p, m, off) { return { disabled: off ? [{ provider: p, model: m }] : [] } },
+    async setGroup(p, off) { return { disabled: off ? [{ provider: p, model: '*' }] : [] } },
+    async setAll(ps, off) { return { disabled: off ? ps.map((p) => ({ provider: p, model: '*' })) : [] } },
   },
 }
 

@@ -1,38 +1,30 @@
 /**
  * dsh-provider-power-switch — host half.
  *
- * 供应商级别模型开关：在「设置 → 模型」页给每个模型供应商一个启用/停用开关。
- * 关闭的供应商：
- *  - 立即在 llm/stream 中间件拦截（不发真实请求、不消耗配额），
- *    返回一条明确的 finish{error} 帧："该供应商已停用"；
- *  - 故障转移插件（fallback-queue / failover）会把它当作失败路由自动跳过；
- *  - 状态存独立 JSON 文件（$DSH_HOME/provider-power-switch-state.json），
- *    不写 settings——写 settings 会推 revision，触发宿主主题全量重算（白闪）。
- *
- * 数据源：llm.listProviders() 返回所有已注册 adapter 的 provider 路由（字段 `.id`），
- * 这是「能发请求的供应商」的权威清单。
+ * 模型级开关（按供应商分组）：
+ *  - 枚举「有活跃适配器的供应商」+「配置目录里声明的供应商」，并读取每个
+ *    供应商的模型清单（settings profile 的 models 数组，回退到 llm.listModels）；
+ *  - llm/stream 中间件按 provider + model 拦截被关闭的模型，返回明确错误帧；
+ *  - 支持按模型、按整个供应商（通配符 *）、全部关闭/开启；
+ *  - 状态存独立 JSON 文件 $DSH_HOME/provider-power-switch-state.json，不写 settings。
  *
  * 安全约定：
- *  - 所有监听器 try/catch 兜底，任何异常都不得拦截请求（异常时放行）；
+ *  - 所有监听器/枚举步骤 try/catch 兜底，任何异常都不得拦截请求（异常时放行）；
  *  - 只拦带 sessionId 的 agent 步骤请求；本插件自己的子请求标记后放行；
- *  - 拦截帧带超大 providerRetryAfterMs，避免宿主 dsh-llm-retry 白重试。
- *  - RPC 方法只返回纯数据（不带 `ok` 字段），避免与 typert 信封的 `ok` 撞名。
+ *  - 拦截帧带超大 providerRetryAfterMs，避免宿主 dsh-llm-retry 白重试；
+ *  - RPC 方法只返回纯数据（不带 ok 字段），避免与 typert 信封的 ok 撞名。
  */
 
-import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol';
-import { readFile, writeFile, rename, mkdir, rm } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { readFile, writeFile, rename, mkdir, rm } from 'node:fs/promises'
+import { dirname } from 'node:path'
 
 /**
- * 与 @deepseek-ai/dsh-typert-protocol 内部常量同值（该包不导出 ./remote-methods
- * 子路径，但协议仍是这个字符串键 + {version:1, methods:[...]} 结构）。
- * ⚠️ 必须给服务原型打 Remote 方法标记：gateway 的 resolveSrcDescriptor
- * （dsh-api-gateway/lib/index.js）只认带标记的方法，缺标记会抛
- * `gateway/invocation-unavailable: no active Remote method exports this endpoint`，
- * RPC 调用失败、客户端兜底成空对象、host 方法压根不执行、日志零条。
- * 这正是「面板显示没有检测到但没有任何日志」的真正根因。
+ * 与 @deepseek-ai/dsh-typert-protocol 内部常量同值。
+ * 必须给服务原型打 Remote 方法标记，否则 gateway 只认带标记的方法，
+ * RPC 调用会全部落空（client 兜底空对象、host 方法不执行、日志零条）。
  */
-const REMOTE_METHOD_DESCRIPTOR = '@deepseek-ai/dsh-typert-protocol/remote-methods';
+const REMOTE_METHOD_DESCRIPTOR = '@deepseek-ai/dsh-typert-protocol/remote-methods'
 
 /** 给原型打 Remote 方法标记（等价于 TS 装饰器编译产物）。 */
 function markRemoteMethods(prototype, methods) {
@@ -44,13 +36,17 @@ function markRemoteMethods(prototype, methods) {
         methods.map((m) => Object.freeze({ method: m, invocation: Object.freeze({ kind: 'direct' }) })),
       ),
     }),
-  });
+  })
 }
 
 export const name = 'dsh-provider-power-switch'
 
 const STATE_FILENAME = 'provider-power-switch-state.json'
-const STATE_VERSION = 2
+const STATE_VERSION = 3
+/** 整组开关使用的模型通配符。 */
+const ALL_MODELS = '*'
+/** key 分隔符：模型 id 允许含 '/'，但不含换行。 */
+const SEP = '\n'
 
 let cachedPath = null
 let ctxLogger = null
@@ -69,22 +65,35 @@ function statePath() {
   return cachedPath
 }
 
-/** 进程内权威状态：停用的 provider 集合。 */
+/** 进程内权威状态：被关闭的 provider/model 键集合。 */
 const disabled = new Set()
 
-function isDisabled(provider) {
-  return typeof provider === 'string' && provider.length > 0 && disabled.has(provider)
+function makeKey(provider, model) {
+  return `${provider}${SEP}${model}`
+}
+
+function parseKey(k) {
+  const i = k.indexOf(SEP)
+  return { provider: k.slice(0, i), model: k.slice(i + 1) }
+}
+
+/** 单个模型是否被关闭：整组通配符或精确模型命中都算。 */
+function isDisabled(provider, model) {
+  if (typeof provider !== 'string' || provider.length === 0) return false
+  if (disabled.has(makeKey(provider, ALL_MODELS))) return true
+  return typeof model === 'string' && model.length > 0 && disabled.has(makeKey(provider, model))
 }
 
 function snapshot() {
-  return { disabled: Array.from(disabled).sort() }
+  const rows = Array.from(disabled).sort().map(parseKey)
+  return { disabled: rows }
 }
 
 /** 原子写：临时文件 + rename，读者只会看到旧内容或新内容。 */
 async function persistState() {
   const target = statePath()
   const tmp = `${target}.${process.pid}.${Date.now()}.tmp`
-  const payload = { version: STATE_VERSION, disabled: Array.from(disabled).sort() }
+  const payload = { version: STATE_VERSION, disabled: snapshot().disabled }
   try {
     await mkdir(dirname(target), { recursive: true })
     await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
@@ -110,8 +119,16 @@ async function loadState() {
     const rows = Array.isArray(parsed?.disabled) ? parsed.disabled : []
     disabled.clear()
     for (const row of rows) {
-      if (typeof row === 'string' && row) disabled.add(row)
-      else if (row && typeof row.provider === 'string' && row.provider) disabled.add(row.provider)
+      // v2: 纯 provider 字符串 → 整组关闭，迁移为通配符键
+      if (typeof row === 'string' && row) {
+        disabled.add(makeKey(row, ALL_MODELS))
+        continue
+      }
+      if (!row || typeof row !== 'object') continue
+      const provider = row.provider
+      if (typeof provider !== 'string' || !provider) continue
+      const model = typeof row.model === 'string' && row.model ? row.model : ALL_MODELS
+      disabled.add(makeKey(provider, model))
     }
   } catch (e) {
     ctxLogger?.warn?.('[provider-power-switch] state parse failed: %s', e?.message)
@@ -121,14 +138,15 @@ async function loadState() {
 /** 本插件内部发起的子请求标记：绝不递归拦截。 */
 const internalStreamOptions = new WeakSet()
 
-async function* disabledStream(provider) {
+async function* disabledStream(provider, model) {
+  const label = model === ALL_MODELS ? provider : `${provider} / ${model}`
   yield {
     type: 'finish',
     reason: {
       kind: 'error',
       failure: {
         code: 'MODEL_DISABLED',
-        message: `模型供应商 ${provider} 已停用：请到 设置 → 模型 的「模型开关」开启后再试。`,
+        message: `模型 ${label} 已停用：请到 设置 → 模型开关 开启后再试。`,
         // 确定性错误，重试无意义：超大重试间隔让 dsh-llm-retry 直接放弃。
         providerRetryAfterMs: 86400000 * 30,
       },
@@ -136,15 +154,147 @@ async function* disabledStream(provider) {
   }
 }
 
+/* ============================== 模型枚举 ============================== */
+
+/** 按 settingsPath 从命名空间 value 中取出 provider profile 对象。 */
+function profileAt(value, path) {
+  let node = value
+  for (const segment of Array.isArray(path) ? path : []) {
+    if (node === null || typeof node !== 'object') return undefined
+    node = node[segment]
+  }
+  return node !== null && typeof node === 'object' ? node : undefined
+}
+
+/** 从 provider profile 中读出 models 数组（pi-ai 与 deepseek 都可能）。 */
+function modelsFromProfile(profile) {
+  const raw = profile?.models
+  if (!Array.isArray(raw)) return []
+  const out = []
+  for (const entry of raw) {
+    if (typeof entry === 'string' && entry) {
+      out.push({ id: entry, name: entry })
+    } else if (entry && typeof entry === 'object' && typeof entry.id === 'string' && entry.id) {
+      out.push({
+        id: entry.id,
+        name: typeof entry.name === 'string' && entry.name ? entry.name : entry.id,
+      })
+    }
+  }
+  return out
+}
+
+function addModels(group, models) {
+  for (const model of models) {
+    if (!group.models.some((m) => m.id === model.id)) group.models.push(model)
+  }
+}
+
+function providerRank(provider) {
+  if (provider === 'deepseek-account') return 0
+  if (provider === 'deepseek-official') return 1
+  return 2
+}
+
+/**
+ * 返回按供应商分组的模型清单。
+ * 数据源：
+ *  - llm.listProviders()：当前能发请求的活跃路由（权威）；
+ *  - llm.listConfigurableProviders() + settings.describe()：用户已配置的网关/自定义路由
+ *    的 models 数组（settingsNs + settingsPath 指向 profile 对象）；
+ *  - llm.listModels()：前两路都没给出模型时，回退到适配器的 catalog。
+ */
+async function listModelGroups() {
+  const llm = llmBridge
+  if (!llm) return { groups: [], failures: [] }
+
+  const map = new Map()
+
+  // 1) 活跃路由
+  try {
+    const rows = typeof llm.listProviders === 'function' ? (llm.listProviders() || []) : []
+    for (const row of rows) {
+      const id = typeof row === 'string' ? row : row?.id
+      if (typeof id !== 'string' || !id) continue
+      if (!map.has(id)) {
+        const displayName = typeof row === 'object' && typeof row.name === 'string' && row.name ? row.name : id
+        map.set(id, { provider: id, displayName, models: [] })
+      }
+    }
+  } catch (e) {
+    ctxLogger?.warn?.('[provider-power-switch] listProviders failed: %s', e?.message)
+  }
+
+  // 2) 配置目录 + settings 里的 models
+  let namespaces = []
+  try {
+    if (settingsBridge && typeof settingsBridge.describe === 'function') namespaces = settingsBridge.describe() || []
+  } catch (e) {
+    ctxLogger?.warn?.('[provider-power-switch] settings.describe failed: %s', e?.message)
+  }
+  try {
+    const rows = typeof llm.listConfigurableProviders === 'function'
+      ? (llm.listConfigurableProviders() || [])
+      : []
+    for (const entry of rows) {
+      const id = entry?.provider
+      if (typeof id !== 'string' || !id) continue
+      let group = map.get(id)
+      if (!group) {
+        group = {
+          provider: id,
+          displayName: typeof entry.displayName === 'string' && entry.displayName ? entry.displayName : id,
+          models: [],
+        }
+        map.set(id, group)
+      }
+      try {
+        const descriptor = namespaces.find((n) => n && n.ns === entry.settingsNs)
+        if (descriptor) {
+          const profile = profileAt(descriptor.value, entry.settingsPath)
+          addModels(group, modelsFromProfile(profile))
+        }
+      } catch (e) {
+        ctxLogger?.warn?.('[provider-power-switch] read profile failed for %s: %s', id, e?.message)
+      }
+    }
+  } catch (e) {
+    ctxLogger?.warn?.('[provider-power-switch] listConfigurableProviders failed: %s', e?.message)
+  }
+
+  // 3) 适配器 catalog 回退
+  await Promise.all([...map.values()].map(async (group) => {
+    if (group.models.length > 0) return
+    try {
+      const listed = typeof llm.listModels === 'function' ? (await llm.listModels(group.provider)) || [] : []
+      addModels(group, listed
+        .filter((m) => m && typeof m.id === 'string' && m.id)
+        .map((m) => ({ id: m.id, name: typeof m.name === 'string' && m.name ? m.name : m.id })))
+    } catch {
+      // NO_ADAPTER / INVALID_CATALOG / 未配置路由：没有模型可列，保留空组即可
+    }
+  }))
+
+  const groups = [...map.values()]
+    .filter((g) => g.models.length > 0)
+    .sort((a, b) =>
+      (providerRank(a.provider) - providerRank(b.provider))
+      || a.provider.localeCompare(b.provider))
+
+  ctxLogger?.info?.('[provider-power-switch] listModelGroups: %d providers, %d models',
+    groups.length, groups.reduce((sum, g) => sum + g.models.length, 0))
+  return { groups, failures: [] }
+}
+
 /* ============================== RPC 服务 ============================== */
 
 /**
- * apply 闭包持有的 llm 引用（模块级桥接）。
+ * apply 闭包持有的服务引用（模块级桥接）。
  * ⚠️ 服务 fiber 的 static inject 必须保持 []（金标准 fallback-queue 同款）：
- * 声明 ['llm'] 会让 RPC 服务 fiber 等不到注入而不激活，RPC 调用静默返回空。
- * llm 只能由已声明 inject=['llm'] 的插件 apply() 写入此桥接变量。
+ * 声明依赖会让 RPC 服务 fiber 等不到注入而不激活，RPC 调用静默返回空。
  */
-let llmRef = null
+let llmBridge = null
+let settingsBridge = null
 
 class ModelSwitchService extends TypertRemoteService {
   static inject = []
@@ -153,70 +303,63 @@ class ModelSwitchService extends TypertRemoteService {
     super(ctx, 'ModelSwitchService', { namespace: 'dsh-provider-power-switch' })
   }
 
-  /** 当前停用的供应商清单。 */
+  /** 当前被关闭的 provider/model 列表。 */
   snapshot() {
     return snapshot()
   }
 
-  /**
-   * 所有可切换的供应商。
-   * 合并两个来源并去重：
-   *  - llm.listProviders()：有活跃 adapter 的路由（能立刻发请求）；
-   *  - llm.listConfigurableProviders()：已声明但适配器可能尚未激活的供应商。
-   * 兼容字段：provider 对象可能是 {id} 或 {provider}，也可能直接是字符串。
-   */
-  listProviders() {
-    const found = new Set()
-    let active = -1
-    let declared = -1
-    try {
-      const llm = llmRef
-      if (llm && typeof llm.listProviders === 'function') {
-        const rows = llm.listProviders() || []
-        active = rows.length
-        for (const p of rows) {
-          const id = typeof p === 'string' ? p
-            : (typeof p?.id === 'string' ? p.id : (typeof p?.provider === 'string' ? p.provider : ''))
-          if (id) found.add(id)
-        }
-      }
-      if (llm && typeof llm.listConfigurableProviders === 'function') {
-        const rows = llm.listConfigurableProviders() || []
-        declared = rows.length
-        for (const p of rows) {
-          const id = typeof p === 'string' ? p
-            : (typeof p?.provider === 'string' ? p.provider : (typeof p?.id === 'string' ? p.id : ''))
-          if (id) found.add(id)
-        }
-      }
-    } catch (e) {
-      ctxLogger?.warn?.('[provider-power-switch] listProviders failed: %s', e?.message)
-    }
-    const debug = `source=bridge,active=${active},declared=${declared},llm=${typeof llmRef}`
-    // warn 级诊断会进 harness.log，空列表时可直接看到两个来源的计数。
-    if (found.size === 0) {
-      ctxLogger?.warn?.('[provider-power-switch] listProviders EMPTY: %s', debug)
-    }
-    return { providers: Array.from(found).sort(), debug }
+  /** 供应商分组的模型清单（异步）。 */
+  listModels() {
+    return listModelGroups()
   }
 
-  /** 单个供应商开/关。返回最新快照。 */
-  async setProvider(provider, off) {
-    if (typeof provider === 'string' && provider) {
-      if (off) disabled.add(provider)
-      else disabled.delete(provider)
+  /** 旧接口兼容：活跃 provider id 列表。 */
+  listProviders() {
+    const providers = []
+    try {
+      for (const row of (llmBridge?.listProviders?.() || [])) {
+        const id = typeof row === 'string' ? row : row?.id
+        if (typeof id === 'string' && id) providers.push(id)
+      }
+    } catch { /* ignore */ }
+    return { providers: providers.sort() }
+  }
+
+  /** 单模型开/关。 */
+  async setModel(provider, model, off) {
+    if (typeof provider === 'string' && provider && typeof model === 'string' && model) {
+      const k = makeKey(provider, model)
+      if (off) disabled.add(k)
+      else disabled.delete(k)
       await persistState()
     }
     return snapshot()
   }
 
-  /** 批量开/关。 */
+  /** 整个供应商开/关（通配符）。 */
+  async setGroup(provider, off) {
+    if (typeof provider === 'string' && provider) {
+      const k = makeKey(provider, ALL_MODELS)
+      if (off) disabled.add(k)
+      else disabled.delete(k)
+      await persistState()
+    }
+    return snapshot()
+  }
+
+  /** 旧接口兼容：setProvider 等价于整组开关。 */
+  async setProvider(provider, off) {
+    return this.setGroup(provider, off)
+  }
+
+  /** 批量：对给定供应商整组开/关。 */
   async setAll(providers, off) {
     if (Array.isArray(providers)) {
-      for (const p of providers) {
-        if (typeof p !== 'string' || !p) continue
-        if (off) disabled.add(p)
-        else disabled.delete(p)
+      for (const provider of providers) {
+        if (typeof provider !== 'string' || !provider) continue
+        const k = makeKey(provider, ALL_MODELS)
+        if (off) disabled.add(k)
+        else disabled.delete(k)
       }
       await persistState()
     }
@@ -224,32 +367,33 @@ class ModelSwitchService extends TypertRemoteService {
   }
 }
 
-// 给服务原型打 Remote 方法标记——缺这个标记 gateway 会抛 invocation-unavailable，
-// RPC 全部不可达（client 只能拿到兜底的空对象）。
-markRemoteMethods(ModelSwitchService.prototype, ['snapshot', 'listProviders', 'setProvider', 'setAll'])
+markRemoteMethods(ModelSwitchService.prototype, [
+  'snapshot', 'listModels', 'listProviders', 'setModel', 'setGroup', 'setProvider', 'setAll',
+])
 
 /* ============================== 插件入口 ============================== */
 
 /**
- * ⚠️ inject 必须声明 'llm'：cordis 的 ctx.get('llm') 只在当前 fiber 的 inject
- * 里声明过才合法，缺声明会抛 `cannot get property "llm" without inject`
- * （日志实锤过：漏声明直接导致整个插件 apply 失败、被 safe-mode 禁用）。
- * 声明 inject 同时保证了 apply fiber 上的服务可见性——时序由 cordis 的
- * 注入等待机制解决（apply 会等 llm 激活后才执行），这不是需要绕开的坑。
+ * ⚠️ inject 必须声明 'llm' 与 'settings'：cordis 的 ctx.get(name) 只在当前 fiber
+ * 的 inject 里声明过才合法，缺声明会抛 cannot get property without inject。
  */
-export const inject = ['llm']
+export const inject = ['llm', 'settings']
 
 export function apply(ctx) {
   const log = ctx?.logger
   ctxLogger = log
 
-  // apply fiber 已声明 inject ['llm']，这里 ctx.get('llm') 合法且必然拿到
-  // 激活后的服务（cordis 等待注入完成才跑 apply）。
   const llm = ctx.get('llm')
-  llmRef = llm
+  llmBridge = llm
+  let settingsService
+  try {
+    settingsService = ctx.get('settings')
+  } catch (e) {
+    log?.warn?.('[provider-power-switch] settings service unavailable: %s', e?.message)
+  }
+  settingsBridge = settingsService
 
   if (!llm || typeof llm.listProviders !== 'function') {
-    // 理论上不可达（inject 保证），出现即说明宿主结构异常——warn 级让日志桥记录。
     log?.warn?.('[provider-power-switch] apply: llm unexpected state=%s (listProviders=%s)',
       typeof llm, typeof llm?.listProviders)
   }
@@ -259,27 +403,35 @@ export function apply(ctx) {
     void loadState().catch((e) => log?.warn?.('[provider-power-switch] boot load failed: %s', e?.message))
   })
 
-  // ---- 核心：llm/stream 中间件拦截 ----
-  // 拦截判定读的是 disabled 集合（内存），不依赖 llm 引用。
+  // ---- 核心：llm/stream 中间件按 provider + model 拦截 ----
   ctx.effect(() => ctx.on('llm/stream', (options, next) => {
+    // 先只在 try 内做「是否拦截」的判定；判定异常时放行，绝不吞掉宿主 stream。
+    // next() 放在 try 外调用：宿主适配器自身的错误必须由 waterfall 原样传播。
+    let block = null
     try {
-      if (!options || typeof options !== 'object') return next()
-      if (internalStreamOptions.has(options)) return next()
-      const sessionId = options.sessionId
-      if (typeof sessionId !== 'string' || sessionId.length === 0) return next()
-      if (!isDisabled(options.provider)) return next()
-      log?.info?.('[provider-power-switch] intercepted provider=%s model=%s', options.provider, options.model)
-      return disabledStream(options.provider)
+      if (options && typeof options === 'object' && !internalStreamOptions.has(options)) {
+        const sessionId = options.sessionId
+        if (typeof sessionId === 'string' && sessionId.length > 0) {
+          const provider = options.provider
+          const model = options.model
+          if (isDisabled(provider, model)) block = { provider, model }
+        }
+      }
     } catch (e) {
-      log?.warn?.('[provider-power-switch] llm/stream wrap failed: %s', e?.message)
-      try { return next() } catch { return disabledStream('unknown') }
+      log?.warn?.('[provider-power-switch] llm/stream guard failed: %s', e?.message)
     }
+    if (block) {
+      log?.info?.('[provider-power-switch] intercepted provider=%s model=%s', block.provider, block.model)
+      return disabledStream(block.provider, block.model)
+    }
+    return next()
   }), 'provider-power-switch llm/stream middleware')
 
   // ---- RPC 服务 ----
   ctx.effect(() => ctx.plugin(ModelSwitchService), 'provider-power-switch rpc service')
   ctx.effect(() => () => {
-    llmRef = null
+    llmBridge = null
+    settingsBridge = null
     ctxLogger = null
   }, 'provider-power-switch bridge cleanup')
 

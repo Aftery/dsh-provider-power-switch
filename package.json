@@ -1,19 +1,21 @@
 {
   "name": "dsh-provider-power-switch",
-  "version": "0.1.6",
-  "description": "供应商级模型开关：在「设置 → 模型开关」分节给每个模型供应商一个启用/停用开关，关闭后立即拦截发往该供应商的请求（不消耗配额），一键全部开启/关闭。Provider-level model switch for DeepSeek Harness: toggle each provider on/off in the \"Model switches\" settings section; disabled providers are intercepted before any real request is sent.",
+  "version": "0.3.0",
+  "description": "按供应商分组的模型开关：在「设置 → 模型开关」分节给每个模型一行启用/停用开关，支持搜索与整组开关；关闭后立即拦截发往该模型的请求（不消耗配额）。Per-model switches grouped by provider in the \"Model switches\" settings section; disabled models are intercepted before any real request is sent.",
   "type": "module",
   "main": "./src/index.js",
   "exports": {
     ".": "./src/index.js",
     "./client": "./src/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./icon": "./icon.svg"
   },
   "files": [
     "src/index.js",
     "src/client.js",
     "cordis.patch.yml",
     "dsh.plugin.json",
+    "icon.svg",
     "README.md",
     "LICENSE",
     "tests/"

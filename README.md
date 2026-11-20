@@ -1,34 +1,32 @@
 # dsh-provider-power-switch
 
-供应商级模型开关：在「设置」左侧的「模型开关」分节给每个模型供应商一个启用/停用开关。
+按供应商分组的模型开关：在「设置」左侧的「模型开关」分节，每个供应商一张卡片，旗下每个模型一行开关。
 
 ## 功能
 
-- 每个已注册的模型供应商一行开关：关闭后该供应商立即被拦截，不再发出任何真实请求、不消耗配额。
-- 拦截发生在 `llm/stream` 中间件（带 sessionId 的 agent 步骤请求），返回明确的错误提示：
-  `模型供应商 X 已停用：请到 设置 → 模型开关 开启后再试。`
-- 「模型开关」分节内「全部开启 / 全部关闭」快捷操作。
-- 状态保存在 `$DSH_HOME/provider-power-switch-state.json`（独立 state 文件 + 原子写，
-  不写 settings——避免 settings revision 触发宿主主题全量重算白闪）。
-- 与故障转移插件兼容：被关闭的供应商在 fallback-queue / failover 眼中就是一条
-  立即失败的路由，会被自动跳过。
+- 供应商分组：活跃适配器供应商 + 已配置的网关/自定义供应商都列出；每个供应商下的模型逐行显示。
+- 每模型开关：关闭某个模型后，发往 `provider + model` 的请求在 `llm/stream` 中间件被立即拦截，返回明确错误提示，不发真实请求、不消耗配额。
+- 整组开关：每个供应商卡片上有「全部启用 / 全部停用」（写入通配符 `provider/*`）。
+- 全局开关：分节顶部「全部开启 / 全部关闭」。
+- 搜索：按供应商名、路由 id、模型名或模型 id 过滤。
+- 供应商折叠：点击卡片头部的供应商名即可收起/展开该组，卡片之间留有间距；搜索时命中项自动展开。
+- 状态灯：供应商名前有一盏圆点，折叠状态下也能看出这组的开关情况——全绿=全部启用，橙=部分停用，红=全部停用。有停用项时计数显示为「启用数/总数」。
+- 与故障转移插件兼容：被关闭的模型在 fallback-queue / failover 眼中就是一条立即失败的路由，会被自动跳过。
+
+## 数据来源
+
+- `llm.listProviders()`：能立刻发请求的活跃路由。
+- `llm.listConfigurableProviders()` + `settings.describe()`：读取 `settingsNs` + `settingsPath` 指向的 profile 里的 `models` 数组（自定义网关的模型清单）。
+- `llm.listModels()`：前两路没有模型时，回退到适配器的 catalog。
 
 ## 安装
 
-1. 桌面端「插件」面板 → 添加本插件（本地目录或 npm 包 `dsh-provider-power-switch`）。
-2. 或手动挂载（profile 的 `cordis.patch.yml`）：
-
-```yaml
-- insert:
-    - id: provider-power-switch
-      name: 'dsh-provider-power-switch'
-```
+桌面端「插件」面板 → 添加本插件（本地目录）。
 
 ## 关闭后的行为
 
-- 会话中已选该供应商的模型：下一步请求被拦截并提示，不发真实请求。
-- 模型选择器里该供应商仍可见（可选中后看到拦截提示）。
-- API Key、模型配置原样保留，随时一键恢复。
+- 会话中已选该模型：下一步请求被拦截并提示，不发真实请求。
+- 模型选择器里该模型仍可见（可选中后看到拦截提示），API Key / 模型配置原样保留，随时一键恢复。
 
 ## 数据文件
 
@@ -36,7 +34,12 @@
 
 ```json
 {
-  "version": 2,
-  "disabled": ["openrouter", "qoder"]
+  "version": 3,
+  "disabled": [
+    { "provider": "magpie-anthropic", "model": "claude-opus-5.5" },
+    { "provider": "opencode-free", "model": "*" }
+  ]
 }
 ```
+
+`model: "*"` 表示整组关闭。v2 的旧格式（纯 provider 字符串）在启动时自动迁移为此格式。

@@ -1,0 +1,59 @@
+{
+  "name": "dsh-provider-power-switch",
+  "version": "0.1.6",
+  "description": "供应商级模型开关：在「设置 → 模型开关」分节给每个模型供应商一个启用/停用开关，关闭后立即拦截发往该供应商的请求（不消耗配额），一键全部开启/关闭。Provider-level model switch for DeepSeek Harness: toggle each provider on/off in the \"Model switches\" settings section; disabled providers are intercepted before any real request is sent.",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/index.js",
+    "src/client.js",
+    "cordis.patch.yml",
+    "dsh.plugin.json",
+    "README.md",
+    "LICENSE",
+    "tests/"
+  ],
+  "engines": {
+    "node": ">=18",
+    "dsh": ">=0.2.0-rc.2 <0.3.0"
+  },
+  "scripts": {
+    "test": "node --test tests/smoke.mjs && node tests/runtime.mjs && node tests/client.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "model",
+    "provider",
+    "switch",
+    "toggle"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.4",
+    "@deepseek-ai/dsh-llm": ">=0.2.1-rc.2",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.2.0-rc.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer"
+      ]
+    }
+  }
+}

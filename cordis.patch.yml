@@ -1,0 +1,9 @@
+# dsh-provider-power-switch bundle patch.
+# 手动挂载（profile cordis.patch.yml）：
+#   - insert:
+#       - id: provider-power-switch
+#         name: 'dsh-provider-power-switch'
+# 或桌面端「插件」面板直接添加。
+- insert:
+    - id: provider-power-switch
+      name: 'dsh-provider-power-switch'

@@ -244,6 +244,105 @@ const mkStream = (provider, model) => intercepted({ provider, model, sessionId: 
   })
 }
 
+// ---- 回归：整组关闭后单独开启某个模型必须真的放行 ----
+// 曾经的 bug：setAll/setGroup 写入通配符 provider/*，之后 setModel(..., false)
+// 只删精确键，通配符仍在 → 该模型继续被拦截，开关点了看起来没反应。
+{
+  await svc.setAll(['opencode-free'], true)
+  check('setAll closed group via wildcard', () => {
+    assert.ok(svc.snapshot().disabled.some((d) => d.provider === 'opencode-free' && d.model === '*'))
+  })
+
+  const snapOff = await svc.setModel('opencode-free', 'beam-free', false)
+  check('re-enabling one model after group-off records an exception', () => {
+    assert.ok((snapOff.exceptions || []).some(
+      (e) => e.provider === 'opencode-free' && e.model === 'beam-free',
+    ))
+    // 通配符仍在（整组仍是关的），但该模型不该再被列为关闭
+    assert.ok(snapOff.disabled.some((d) => d.provider === 'opencode-free' && d.model === '*'))
+  })
+  check('re-enabled model actually passes through', () => {
+    let called = false
+    intercepted({ provider: 'opencode-free', model: 'beam-free', sessionId: 's1' }, () => {
+      called = true; return 'host'
+    })
+    assert.equal(called, true)
+  })
+  check('sibling model of that group stays blocked', () => {
+    let called = false
+    intercepted({ provider: 'opencode-free', model: 'deepseek-v4.1-flash-free', sessionId: 's1' }, () => {
+      called = true; return 'host'
+    })
+    assert.equal(called, false)
+  })
+}
+
+// ---- 回归：整组关闭时有例外，再点「全部启用」必须全部放行 ----
+// 曾经的 bug：setGroup(..., false) 只删通配符，之前逐个关闭的精确键残留。
+{
+  await svc.setGroup('qoder', true)
+  await svc.setModel('qoder', 'qmodel_latest', false)   // 组内单独开一个
+  await svc.setGroup('qoder', false)                    // 再点全部启用
+
+  const snap = svc.snapshot()
+  check('enable-all clears wildcard, exact keys and exceptions', () => {
+    assert.equal(snap.disabled.some((d) => d.provider === 'qoder'), false)
+    assert.equal((snap.exceptions || []).some((e) => e.provider === 'qoder'), false)
+  })
+  for (const model of ['qmodel_latest', 'qmodel_38max']) {
+    let called = false
+    intercepted({ provider: 'qoder', model, sessionId: 's1' }, () => { called = true; return 'host' })
+    check(`enable-all unblocks ${model}`, () => assert.equal(called, true))
+  }
+}
+
+// ---- 例外集必须跟着状态一起落盘并在重启后生效 ----
+{
+  await svc.setGroup('opencode-free', true)
+  await svc.setModel('opencode-free', 'beam-free', false)
+
+  const text = await readFile(join(home, 'provider-power-switch-state.json'), 'utf8')
+  const parsed = JSON.parse(text)
+  check('exceptions persisted to state file', () => {
+    assert.ok(Array.isArray(parsed.exceptions))
+    assert.ok(parsed.exceptions.some(
+      (e) => e.provider === 'opencode-free' && e.model === 'beam-free',
+    ))
+  })
+
+  const mod3 = await import(indexUrl.href + '?exceptions=1')
+  const listeners3 = new Map()
+  const ctx3 = {
+    logger: ctx.logger,
+    get: ctx.get,
+    reflect: ctx.reflect,
+    effect(fn) { fn() },
+    on(event, listener) {
+      if (!listeners3.has(event)) listeners3.set(event, [])
+      listeners3.get(event).push(listener)
+      return () => {}
+    },
+    plugin(cls) { ctx3.__service = new cls(ctx3) },
+  }
+  mod3.apply(ctx3)
+  await new Promise((r) => setTimeout(r, 50))
+  const reloadedIntercept = (listeners3.get('llm/stream') || [])[0]
+  check('exception survives a restart', () => {
+    let called = false
+    reloadedIntercept({ provider: 'opencode-free', model: 'beam-free', sessionId: 's1' }, () => {
+      called = true; return 'host'
+    })
+    assert.equal(called, true)
+  })
+  check('restart still blocks non-excepted sibling', () => {
+    let called = false
+    reloadedIntercept({ provider: 'opencode-free', model: 'deepseek-v4.1-flash-free', sessionId: 's1' }, () => {
+      called = true; return 'host'
+    })
+    assert.equal(called, false)
+  })
+}
+
 // ---- 恢复 ----
 {
   await svc.setModel('magpie-anthropic', 'claude-opus-5.5', false)

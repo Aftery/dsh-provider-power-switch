@@ -198,6 +198,7 @@ window.__ModuleLoader__.load({
     function ModelSwitchPanel({ rpc }) {
       const [groups, setGroups] = React.useState(null)
       const [disabled, setDisabled] = React.useState([])
+      const [exceptions, setExceptions] = React.useState([])
       const [busy, setBusy] = React.useState(false)
       const [failure, setFailure] = React.useState('')
       const [query, setQuery] = React.useState('')
@@ -214,6 +215,7 @@ window.__ModuleLoader__.load({
           const list = (gDoc && gDoc.groups) || []
           setGroups(list)
           setDisabled((sDoc && sDoc.disabled) || [])
+          setExceptions((sDoc && sDoc.exceptions) || [])
           setFailure(list.length === 0
             ? t('emptyReason') + (gDoc && gDoc.debug ? ` [${String(gDoc.debug).slice(0, 200)}]` : '')
             : '')
@@ -226,8 +228,12 @@ window.__ModuleLoader__.load({
       React.useEffect(() => { refresh() }, [refresh])
 
       const applySnapshot = (snap) => {
-        if (snap && Array.isArray(snap.disabled)) setDisabled(snap.disabled)
-        else refresh()
+        if (snap && Array.isArray(snap.disabled)) {
+          setDisabled(snap.disabled)
+          setExceptions(snap.exceptions || [])
+        } else {
+          refresh()
+        }
       }
 
       const run = async (fn) => {
@@ -238,9 +244,13 @@ window.__ModuleLoader__.load({
         finally { setBusy(false) }
       }
 
-      const isModelOff = (provider, model) => disabled.some(
-        (d) => d.provider === provider && (d.model === model || d.model === '*'),
-      )
+      // 单个模型是否关闭：与服务端同一套优先级——例外（整组关后单独开的）优先于通配符。
+      const isModelOff = (provider, model) => {
+        if (exceptions.some((e) => e.provider === provider && e.model === model)) return false
+        return disabled.some(
+          (d) => d.provider === provider && (d.model === model || d.model === '*'),
+        )
+      }
       const isGroupOff = (provider) => disabled.some(
         (d) => d.provider === provider && d.model === '*',
       )

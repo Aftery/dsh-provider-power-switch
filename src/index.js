@@ -67,6 +67,11 @@ function statePath() {
 
 /** 进程内权威状态：被关闭的 provider/model 键集合。 */
 const disabled = new Set()
+/**
+ * 例外集：整组关闭（通配符 provider/*）之后又被单独开启的模型。
+ * 优先级高于通配符——否则通配符会继续拦截它们，单模型的「开启」就永远没反应。
+ */
+const exceptions = new Set()
 
 function makeKey(provider, model) {
   return `${provider}${SEP}${model}`
@@ -77,23 +82,46 @@ function parseKey(k) {
   return { provider: k.slice(0, i), model: k.slice(i + 1) }
 }
 
-/** 单个模型是否被关闭：整组通配符或精确模型命中都算。 */
+/** 单个模型是否被关闭：例外集优先，其次整组通配符或精确模型命中。 */
 function isDisabled(provider, model) {
   if (typeof provider !== 'string' || provider.length === 0) return false
+  const exact = typeof model === 'string' && model.length > 0
+  // 整组关后单独开启的模型：例外优先，看都不看通配符
+  if (exact && exceptions.has(makeKey(provider, model))) return false
   if (disabled.has(makeKey(provider, ALL_MODELS))) return true
-  return typeof model === 'string' && model.length > 0 && disabled.has(makeKey(provider, model))
+  return exact && disabled.has(makeKey(provider, model))
+}
+
+/** 删掉某供应商下所有精确模型键（保留通配符本身）。 */
+function pruneProvider(provider) {
+  for (const k of Array.from(disabled)) {
+    const row = parseKey(k)
+    if (row.provider === provider && row.model !== ALL_MODELS) disabled.delete(k)
+  }
+}
+
+/** 删掉某供应商下所有例外。 */
+function clearExceptions(provider) {
+  for (const k of Array.from(exceptions)) {
+    if (parseKey(k).provider === provider) exceptions.delete(k)
+  }
 }
 
 function snapshot() {
   const rows = Array.from(disabled).sort().map(parseKey)
-  return { disabled: rows }
+  const except = Array.from(exceptions).sort().map(parseKey)
+  return except.length > 0 ? { disabled: rows, exceptions: except } : { disabled: rows }
 }
 
 /** 原子写：临时文件 + rename，读者只会看到旧内容或新内容。 */
 async function persistState() {
   const target = statePath()
   const tmp = `${target}.${process.pid}.${Date.now()}.tmp`
-  const payload = { version: STATE_VERSION, disabled: snapshot().disabled }
+  const payload = {
+    version: STATE_VERSION,
+    disabled: snapshot().disabled,
+    exceptions: snapshot().exceptions || [],
+  }
   try {
     await mkdir(dirname(target), { recursive: true })
     await writeFile(tmp, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 })
@@ -117,7 +145,9 @@ async function loadState() {
   try {
     const parsed = JSON.parse(text)
     const rows = Array.isArray(parsed?.disabled) ? parsed.disabled : []
+    const excepts = Array.isArray(parsed?.exceptions) ? parsed.exceptions : []
     disabled.clear()
+    exceptions.clear()
     for (const row of rows) {
       // v2: 纯 provider 字符串 → 整组关闭，迁移为通配符键
       if (typeof row === 'string' && row) {
@@ -129,6 +159,14 @@ async function loadState() {
       if (typeof provider !== 'string' || !provider) continue
       const model = typeof row.model === 'string' && row.model ? row.model : ALL_MODELS
       disabled.add(makeKey(provider, model))
+    }
+    for (const row of excepts) {
+      if (!row || typeof row !== 'object') continue
+      const provider = row.provider
+      const model = row.model
+      if (typeof provider !== 'string' || !provider) continue
+      if (typeof model !== 'string' || !model || model === ALL_MODELS) continue
+      exceptions.add(makeKey(provider, model))
     }
   } catch (e) {
     ctxLogger?.warn?.('[provider-power-switch] state parse failed: %s', e?.message)
@@ -329,8 +367,16 @@ class ModelSwitchService extends TypertRemoteService {
   async setModel(provider, model, off) {
     if (typeof provider === 'string' && provider && typeof model === 'string' && model) {
       const k = makeKey(provider, model)
-      if (off) disabled.add(k)
-      else disabled.delete(k)
+      if (off) {
+        // 关：清掉可能存在的例外，再写精确键
+        exceptions.delete(k)
+        disabled.add(k)
+      } else {
+        // 开：清掉精确键；若整组仍关着，再记为例外，否则通配符会继续拦截它
+        disabled.delete(k)
+        if (disabled.has(makeKey(provider, ALL_MODELS))) exceptions.add(k)
+        else exceptions.delete(k)
+      }
       await persistState()
     }
     return snapshot()
@@ -340,8 +386,17 @@ class ModelSwitchService extends TypertRemoteService {
   async setGroup(provider, off) {
     if (typeof provider === 'string' && provider) {
       const k = makeKey(provider, ALL_MODELS)
-      if (off) disabled.add(k)
-      else disabled.delete(k)
+      if (off) {
+        // 关：之前逐个关闭的精确键已无意义，合并成一条通配符，例外清空
+        disabled.add(k)
+        pruneProvider(provider)
+        clearExceptions(provider)
+      } else {
+        // 开：通配符与组内所有精确键/例外一起清掉，否则「全部启用」同样点不动
+        disabled.delete(k)
+        pruneProvider(provider)
+        clearExceptions(provider)
+      }
       await persistState()
     }
     return snapshot()
@@ -358,8 +413,14 @@ class ModelSwitchService extends TypertRemoteService {
       for (const provider of providers) {
         if (typeof provider !== 'string' || !provider) continue
         const k = makeKey(provider, ALL_MODELS)
-        if (off) disabled.add(k)
-        else disabled.delete(k)
+        if (off) {
+          disabled.add(k)
+          pruneProvider(provider)
+        } else {
+          disabled.delete(k)
+          pruneProvider(provider)
+        }
+        clearExceptions(provider)
       }
       await persistState()
     }

@@ -47,8 +47,24 @@
   "disabled": [
     { "provider": "magpie-anthropic", "model": "claude-opus-5.5" },
     { "provider": "opencode-free", "model": "*" }
+  ],
+  "exceptions": [
+    { "provider": "opencode-free", "model": "beam-free" }
   ]
 }
 ```
 
 `model: "*"` 表示整组关闭。v2 的旧格式（纯 provider 字符串）在启动时自动迁移为此格式。
+
+`exceptions` 记录「整组关闭之后又被单独开启」的模型，优先级高于通配符——没有它，
+整组关掉之后再点单个模型的开关就不会有任何效果。点「全部启用」或在组内逐个恢复时会清空对应条目。
+
+## 分支状态说明
+
+禁用状态由两组词表叠加而成，判断顺序与服务端、客户端一致：
+
+1. `exceptions` 命中 → **启用**（哪怕该供应商整组关着）
+2. `disabled` 里该供应商有 `*` 通配 → 停用
+3. `disabled` 里精确命中 `provider + model` → 停用
+
+「全部关闭」把整组折叠成一条 `provider/*`；「全部启用」会同时清掉通配符、组内精确键与例外。

@@ -402,6 +402,103 @@ window.__ModuleLoader__.load({
       }, E('path', { d: SPARK_PATH, fill: 'currentColor' }))
     }
 
+    /* ---------- 导航图标的 DOM 兜底 ---------- */
+
+    // 有些宿主（实测 dsh-tauri-ui）声明了 settings.section.icon 座位，面板里也能
+    // 查到我们的注册项（active:true），但它画图标时用的是一张写死的 id 映射表
+    // ——`Ft[e.id] ?? 齿轮`——从不读取该座位的注册内容。这种情况下上面的
+    // slots.register 会「成功但完全不可见」。
+    //
+    // 所以再补一层兜底：直接找到标签匹配的那一行，隐藏宿主自己画的图标，
+    // 用 CSS mask 把我们这枚四芒星画上去。mask 的可见色来自 currentColor，
+    // 选中/未选中配色仍然由外壳掌控，不写死颜色。
+
+    const NAV_ROW_SELECTOR = '[role="dialog"] nav button'
+    const NAV_MARK = 'data-dmps-nav-icon'
+
+    /** 四芒星的 mask（mask 只读 alpha，填充色值本身不参与显示）。 */
+    function sparkMaskUrl() {
+      const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36">'
+        + `<path d="${SPARK_PATH}" fill="#000"/></svg>`
+      return `data:image/svg+xml,${encodeURIComponent(svg)}`
+    }
+
+    function navIconCss(url) {
+      return [
+        `[${NAV_MARK}] > svg { display: none; }`,
+        `[${NAV_MARK}]::before {`,
+        `  content: '';`,
+        `  flex: none;`,
+        `  width: 16px;`,
+        `  height: 16px;`,
+        `  background-color: currentColor;`,
+        `  -webkit-mask-image: url("${url}");`,
+        `  mask-image: url("${url}");`,
+        `  -webkit-mask-repeat: no-repeat;`,
+        `  mask-repeat: no-repeat;`,
+        `  -webkit-mask-position: center;`,
+        `  mask-position: center;`,
+        `  -webkit-mask-size: 16px 16px;`,
+        `  mask-size: 16px 16px;`,
+        `}`,
+      ].join('\n')
+    }
+
+    /**
+     * 给当前分节的导航行换上我们的图标。
+     * 只认「可见文本等于本分节 label」的那一行——空 label 一律不匹配，
+     * 避免 locale 还没解析出来时把整排导航都标上。
+     */
+    function installNavIconStandIn(ctx) {
+      if (typeof document === 'undefined' || typeof MutationObserver === 'undefined') return
+      ctx.effect(() => {
+        const tag = document.createElement('style')
+        tag.dataset.plugin = 'dsh-provider-power-switch'
+        tag.dataset.pluginCss = 'dsh-provider-power-switch/settings-nav-icon'
+        tag.textContent = navIconCss(sparkMaskUrl())
+        document.head.appendChild(tag)
+
+        let disposed = false
+        let scheduled = false
+
+        const sync = () => {
+          scheduled = false
+          if (disposed) return
+          const wanted = String(t('title') ?? '').trim()
+          if (!wanted) return
+          for (const row of document.querySelectorAll(NAV_ROW_SELECTOR)) {
+            const text = String(row.textContent ?? '').trim()
+            if (text !== wanted) {
+              row.removeAttribute(NAV_MARK)
+              continue
+            }
+            // 宿主若已经画出我们的图标（同一个 36 viewBox 的四芒星），就交给它，不接管
+            if (row.querySelector(':scope > svg[viewBox="0 0 36 36"]')) row.removeAttribute(NAV_MARK)
+            else row.setAttribute(NAV_MARK, '')
+          }
+        }
+
+        const schedule = () => {
+          if (scheduled || disposed) return
+          scheduled = true
+          queueMicrotask(sync)
+        }
+
+        sync()
+        // 只监听结构/文本变化，不监听 attribute——否则自己打标记会触发自己
+        const observer = new MutationObserver(schedule)
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true })
+
+        return () => {
+          if (disposed) return
+          disposed = true
+          observer.disconnect()
+          for (const row of document.querySelectorAll(`[${NAV_MARK}]`)) row.removeAttribute(NAV_MARK)
+          tag.remove()
+        }
+      }, 'dsh-provider-power-switch: settings nav icon stand-in')
+    }
+
     /* ============================== 注册 ============================== */
 
     return {
@@ -468,6 +565,11 @@ window.__ModuleLoader__.load({
             return undefined
           }
         })
+
+        // 上面那条注册只对「读取该座位」的宿主有效。宿主不读时（实测 dsh-tauri-ui）
+        // 它静默无效，所以再挂一层 DOM 兜底；两者互不冲突——宿主自己画出我们的
+        // 四芒星时，兜底会主动让位。
+        installNavIconStandIn(ctx)
       },
     }
 

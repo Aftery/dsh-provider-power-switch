@@ -17,10 +17,19 @@
 
 两处图标是两件事，都在本插件里：
 
-- **设置导航行的图标**：通过 `settings.section.icon` 座位注册（id 必须等于分节的 `dsh-provider-power-switch`），
-  画的是四芒星，用 `currentColor` 跟随外壳的选中/未选中配色。老宿主若没有声明这个座位，
-  `slots.inject` 会直接跳过，外壳退回默认齿轮，不影响分节本身。
+- **设置导航行的图标**：主路径是通过 `settings.section.icon` 座位注册（id 必须等于分节的
+  `dsh-provider-power-switch`），画的是四芒星，用 `currentColor` 跟随外壳的选中/未选中配色。
 - **插件面板里的图标**：包根 `icon.svg`，经 `package.json` 的 `./icon` 导出。
+
+### 为什么要额外挂一层 DOM 兜底
+
+实测某些宿主（如 `dsh-tauri-ui`）**声明了** `settings.section.icon` 座位，面板里也能查到我们的
+注册项（`active: true`），但它渲染导航图标时用的是一张写死的 id 映射表——`Ft[sectionId] ?? 齿轮`——
+**从不读取该座位的注册内容**。这种宿主上，正式注册会「成功但完全不可见」。
+
+所以再补一层兜底（`installNavIconStandIn`）：按可见文本找到标签匹配的那一行，隐藏宿主自己画的
+图标，用 CSS `mask-image` 把四芒星画上去。mask 的可见色来自 `currentColor`，配色仍由外壳掌控。
+两条路径互不冲突——宿主若已经画出同一个 36 视框的四芒星，兜底会主动让位。
 
 ## 数据来源
 

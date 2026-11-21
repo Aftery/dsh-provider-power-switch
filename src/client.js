@@ -372,6 +372,26 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* ============================== 导航图标 ============================== */
+
+    // 设置左侧导航行的图标（settings.section.icon，按分节 id 匹配）。
+    // 与 icon.svg 同一枚四芒星；用 currentColor 让外壳自己处理选中/未选中配色。
+    // 控制点比 icon.svg 略靠外，让芒臂在 16px 导航行里也够粗，不至于细成一根线。
+    const SPARK_PATH = 'M18 5.5 C20.6 13.2 22.8 15.4 30.5 18 C22.8 20.6 20.6 22.8 18 30.5'
+      + ' C15.4 22.8 13.2 20.6 5.5 18 C13.2 15.4 15.4 13.2 18 5.5 Z'
+
+    function NavIcon(props) {
+      const edge = Number.isFinite(props?.size) ? props.size : 16
+      return E('svg', {
+        width: edge,
+        height: edge,
+        viewBox: '0 0 36 36',
+        fill: 'none',
+        'aria-hidden': 'true',
+        focusable: 'false',
+      }, E('path', { d: SPARK_PATH, fill: 'currentColor' }))
+    }
+
     /* ============================== 注册 ============================== */
 
     return {
@@ -419,6 +439,22 @@ window.__ModuleLoader__.load({
             }, (props) => E(ModelSwitchPanel, { ...props, rpc: makeRpc(face) }))
           } catch (e) {
             console.warn('[dsh-provider-power-switch] settings.section register failed', e)
+            return undefined
+          }
+        })
+
+        // 导航图标是独立座位，按分节 id 匹配；老宿主没声明这个座位时会被
+        // slots.inject 直接跳过，不影响分节本身（外壳会退回默认齿轮）。
+        slots.inject('settings.section.icon', () => {
+          try {
+            return slots.register({
+              name: 'settings.section.icon',
+              id: 'dsh-provider-power-switch',
+              order: 99,
+              label: () => t('title'),
+            }, NavIcon)
+          } catch (e) {
+            console.warn('[dsh-provider-power-switch] settings.section.icon register failed', e)
             return undefined
           }
         })

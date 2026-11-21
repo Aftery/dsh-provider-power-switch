@@ -1,6 +1,6 @@
 {
   "name": "dsh-provider-power-switch",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "按供应商分组的模型开关：在「设置 → 模型开关」分节给每个模型一行启用/停用开关，支持搜索与整组开关；关闭后立即拦截发往该模型的请求（不消耗配额）。Per-model switches grouped by provider in the \"Model switches\" settings section; disabled models are intercepted before any real request is sent.",
   "type": "module",
   "main": "./src/index.js",

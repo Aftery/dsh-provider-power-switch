@@ -97,6 +97,30 @@ check('settings.section registration has id/order', () => {
   if (!section.options.id) throw new Error('no id')
   if (typeof section.options.order !== 'number') throw new Error('no order')
 })
+check('registered settings.section.icon with matching id', () => {
+  const section = registrations.find((r) => r.options.name === 'settings.section')
+  const icon = registrations.find((r) => r.options.name === 'settings.section.icon')
+  if (!icon) throw new Error('no settings.section.icon registration')
+  // 插槽约定：图标 id 必须等于目标分节 id，否则永不渲染
+  if (icon.options.id !== section.options.id) {
+    throw new Error(`icon id ${icon.options.id} != section id ${section.options.id}`)
+  }
+  if (typeof icon.component !== 'function') throw new Error('icon component not a function')
+})
+check('nav icon renders an svg using currentColor', () => {
+  const icon = registrations.find((r) => r.options.name === 'settings.section.icon')
+  for (const size of [16, undefined]) {
+    const node = icon.component(size === undefined ? {} : { size, active: false })
+    if (node.type !== 'svg') throw new Error('root is not svg: ' + node.type)
+    if (node.props.viewBox !== '0 0 36 36') throw new Error('bad viewBox: ' + node.props.viewBox)
+    if (node.props.width !== (size ?? 16)) throw new Error('bad width: ' + node.props.width)
+    const path = node.children[0]
+    if (!path || path.type !== 'path') throw new Error('no path child')
+    // 跟随外壳配色，不能在图标里写死颜色
+    if (path.props.fill !== 'currentColor') throw new Error('path fill not currentColor: ' + path.props.fill)
+    if (path.props.d && !path.props.d.startsWith('M18 ')) throw new Error('unexpected path data')
+  }
+})
 
 console.log(results.join('\n'))
 const failed = results.filter((r) => r.startsWith('FAIL'))

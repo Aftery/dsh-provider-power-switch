@@ -14,6 +14,7 @@ window.__ModuleLoader__.load({
   id: 'dsh-provider-power-switch',
   factory: (require) => {
     const React = require('react')
+    const ReactDOM = require('react-dom')
     const E = React.createElement
 
     /* ============================== i18n ============================== */
@@ -49,6 +50,11 @@ window.__ModuleLoader__.load({
         status_partial: '该供应商下部分模型已停用',
         status_off: '该供应商下的模型全部停用',
         status_idle: '该供应商下没有模型',
+        ctxWindow: '上下文窗口',
+        selectorFallback: '模型选择器加载中…',
+        selectModel: '选择模型',
+        noModels: '暂无可用模型',
+        loading: '正在加载…',
       },
       en: {
         title: 'Model switches',
@@ -74,6 +80,11 @@ window.__ModuleLoader__.load({
         status_partial: 'Some models of this provider are disabled',
         status_off: 'All models of this provider are disabled',
         status_idle: 'This provider has no models',
+        ctxWindow: 'Context window',
+        selectorFallback: 'Loading model selector…',
+        selectModel: 'Select model',
+        noModels: 'No models available',
+        loading: 'Loading…',
       },
     }
 
@@ -139,6 +150,22 @@ window.__ModuleLoader__.load({
         .dmps-switch[data-on="true"] .dmps-knob { left:18px; }
         .dmps-empty { font-size:12px; color:var(--dsw-alias-label-tertiary); margin:8px 0; }
         .dmps-error { font-size:12px; color:var(--dsw-alias-state-error-primary); margin:0; }
+        .dmps-ctx-window { flex:0 0 auto; margin-left:auto; padding-left:10px; font-size:11px; line-height:20px; color:var(--dsw-alias-label-caption); font-variant-numeric:tabular-nums; }
+        .dmps-sel { position:relative; min-width:0; }
+        .dmps-sel-trigger { display:inline-flex; align-items:center; gap:4px; height:28px; padding:0 8px; border-radius:var(--dsw-radius-sm); border:none; background:transparent; color:var(--dsw-alias-label-secondary); font-size:13px; line-height:20px; cursor:pointer; max-width:360px; }
+        .dmps-sel-trigger:hover:not(:disabled) { background:var(--dsw-alias-interactive-bg-hover); }
+        .dmps-sel-trigger:disabled { color:var(--dsw-alias-label-dimmed); cursor:default; }
+        .dmps-sel-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+        .dmps-sel-caret { flex:0 0 auto; color:var(--dsw-alias-label-caption); }
+        .dmps-sel-menu { z-index:99999; min-width:240px; max-width:360px; overflow:auto; background:var(--dsw-alias-bg-layer-2, var(--dsw-alias-settings-card-fill)); border:.5px solid var(--dsw-alias-border-l3); border-radius:var(--dsw-radius-lg); padding:4px; box-shadow:0 8px 24px rgba(0,0,0,0.18); }
+        .dmps-sel-group { padding:4px 0; }
+        .dmps-sel-group-title { padding:4px 10px; font-size:11px; line-height:16px; color:var(--dsw-alias-label-caption); }
+        .dmps-sel-item { display:flex; align-items:center; gap:8px; width:100%; padding:5px 10px; border:none; border-radius:var(--dsw-radius-md); background:transparent; color:var(--dsw-alias-label-primary); font-size:13px; line-height:20px; cursor:pointer; text-align:left; }
+        .dmps-sel-item:hover { background:var(--dsw-alias-interactive-bg-hover); }
+        .dmps-sel-item[data-selected="true"] { color:var(--dsw-alias-state-business-primary); }
+        .dmps-sel-item-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+        .dmps-sel-check { flex:0 0 auto; }
+        .dmps-sel-empty { padding:12px 10px; font-size:12px; color:var(--dsw-alias-label-tertiary); }
       `
       document.head.appendChild(styleEl)
     }
@@ -170,6 +197,10 @@ window.__ModuleLoader__.load({
           { name: 'providers', wire: 'providers', source: 'json', codec: jsonCodec('dsh-provider-power-switch#Providers') },
           { name: 'off', wire: 'off', source: 'json', codec: jsonCodec('dsh-provider-power-switch#Off') },
         ], result: { mode: 'src-json' } },
+        { id: `${NS}#${NS}/contextWindowFor`, service: 'ModelSwitchService', namespace: NS, method: 'contextWindowFor', invocation: { kind: 'direct' }, parameters: [
+          { name: 'provider', wire: 'provider', source: 'json', codec: jsonCodec('dsh-provider-power-switch#Provider') },
+          { name: 'model', wire: 'model', source: 'json', codec: jsonCodec('dsh-provider-power-switch#Model') },
+        ], result: { mode: 'src-json' } },
       ],
     }
 
@@ -177,6 +208,29 @@ window.__ModuleLoader__.load({
       if (r && typeof r === 'object' && r.ok === true && 'value' in r) return r.value
       if (r && typeof r === 'object' && r.ok === false) return null
       return r ?? null
+    }
+
+    /* ======================= 共享开关状态（设置页 ↔ 选择器） ======================= */
+
+    // 选择器要同步、无 RPC 地判断「某模型是否已停用」，所以把快照缓存到模块内，
+    // 设置页每次改开关都推一份过来；选择器座位挂载时再从 RPC 拉一次作初始化。
+    let switchState = { disabled: [], exceptions: [] }
+    const switchListeners = new Set()
+    function setSwitchState(next) {
+      switchState = {
+        disabled: Array.isArray(next?.disabled) ? next.disabled : [],
+        exceptions: Array.isArray(next?.exceptions) ? next.exceptions : [],
+      }
+      for (const l of switchListeners) l()
+    }
+    function subscribeSwitch(listener) {
+      switchListeners.add(listener)
+      return () => switchListeners.delete(listener)
+    }
+    function isDisabledFrom(state, provider, model) {
+      if (state.exceptions.some((e) => e.provider === provider && e.model === model)) return false
+      return state.disabled.some((d) =>
+        d.provider === provider && (d.model === model || d.model === '*'))
     }
 
     /* ============================== 组件 ============================== */
@@ -216,6 +270,7 @@ window.__ModuleLoader__.load({
           setGroups(list)
           setDisabled((sDoc && sDoc.disabled) || [])
           setExceptions((sDoc && sDoc.exceptions) || [])
+          setSwitchState(sDoc || {})
           setFailure(list.length === 0
             ? t('emptyReason') + (gDoc && gDoc.debug ? ` [${String(gDoc.debug).slice(0, 200)}]` : '')
             : '')
@@ -231,6 +286,7 @@ window.__ModuleLoader__.load({
         if (snap && Array.isArray(snap.disabled)) {
           setDisabled(snap.disabled)
           setExceptions(snap.exceptions || [])
+          setSwitchState(snap)
         } else {
           refresh()
         }
@@ -382,6 +438,251 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /* ======================= 模型选择器：包一层 ======================= */
+
+    const SEAT = 'conversation.input.model'
+
+    /**
+     * 子槽降级策略：label/options 子槽完全不渲染第三方组件。
+     *
+     * 为什么不再手动重渲染子槽组件：这些组件（TeamModeToggle、qoder 徽标等）依赖
+     * 框架注入的一整套 hooks（useSession/useProjection/useSessions/…）和它们各自的
+     * inject(sessionId)，靠兄弟插件手抄转发必然遗漏，一旦缺一项就整格崩溃、被框架
+     * 弃权回退宿主——这正是前面三次踩坑（useSession / t / manualRenderSlot）的根源。
+     *
+     * 放弃第三方 options/label 装饰，换取「绝不崩溃」；核心需求（隐藏停用模型 +
+     * 上下文窗口长度）不受影响。模型名用 model.name 纯文本渲染，与宿主 fallback 一致。
+     */
+
+    // 上下文窗口缓存 + 订阅（异步 RPC，回来后触发选择器重渲染）。
+    const windowCache = new Map()
+    const windowPending = new Set()
+    const windowListeners = new Set()
+    let selectorRpc = null
+    function formatWindow(n) {
+      if (n >= 1_000_000) return `${Number((n / 1_000_000).toFixed(1))}M`
+      if (n >= 1_000) return `${Math.round(n / 1_000)}K`
+      return String(n)
+    }
+
+    /**
+     * 包住宿主目录 store：getSnapshot 里剔除停用模型，并为当前已选中的停用模型
+     * 留一格（否则触发按钮会退回"请选择模型"）。用稳定引用做记忆，避免
+     * useSyncExternalStore 因每次新对象而无限重渲染。
+     */
+    function makeFilteredDirectory(store) {
+      const listeners = new Set()
+      let lastRaw = Symbol('init')
+      let lastSwitch = null
+      let lastResult = null
+      const notify = () => { for (const l of listeners) l() }
+      const unsubStore = typeof store.subscribe === 'function' ? store.subscribe(notify) : () => {}
+      const unsubSwitch = subscribeSwitch(notify)
+      return {
+        subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener) },
+        getSnapshot() {
+          const raw = store.getSnapshot()
+          if (raw === lastRaw && switchState === lastSwitch) return lastResult
+          lastRaw = raw
+          lastSwitch = switchState
+          const groups = Array.isArray(raw?.groups)
+            ? raw.groups.map((g) => ({
+                ...g,
+                models: (g.models || []).filter((m) =>
+                  !isDisabledFrom(switchState, g.id, m.id)
+                  || (raw.current && raw.current.provider === g.id && raw.current.model === m.id)),
+              })).filter((g) => g.models.length > 0)
+            : raw?.groups
+          lastResult = raw ? { ...raw, groups } : raw
+          return lastResult
+        },
+        dispose() { unsubStore(); unsubSwitch(); listeners.clear() },
+      }
+    }
+
+    let ctxLocale = null
+
+    /**
+     * 完全自研的模型选择器（对齐 neartoken 的 A2 路线）：只消费座位注入的
+     * plain props（available/directory/load/select/resolveText/t/locked），
+     * 不渲染任何第三方子槽组件，因此不可能因别的插件缺 hooks 而崩溃。
+     *
+     * 功能：
+     *  - 隐藏已停用模型（store 已被 makeFilteredDirectory 过滤）；
+     *  - 每个模型行尾显示上下文窗口长度（128K / 64K，取不到就不显示）。
+     * 代价：qoder 徽标 / agent-team「团队模式」行不再出现在这个选择器里
+     * ——这是换取「绝不崩溃」的取舍，后续可再按需补。
+     */
+    function FilteredModelSelect(props) {
+      const { locked, available, directory, load, select } = props
+      const tt = props.t || t
+      const state = React.useSyncExternalStore(
+        (cb) => (typeof directory?.subscribe === 'function' ? directory.subscribe(cb) : () => {}),
+        () => (typeof directory?.getSnapshot === 'function' ? directory.getSnapshot() : null),
+      )
+      const [open, setOpen] = React.useState(false)
+      const [anchor, setAnchor] = React.useState(null)
+      const [, force] = React.useState(0)
+      const rootRef = React.useRef(null)
+      const triggerRef = React.useRef(null)
+      const menuRef = React.useRef(null)
+
+      // 菜单是固定浮层：必须 portal 到 body（composer 有包含块会裁切），
+      // 并按触发器的实际位置算坐标；下方空间不够就向上弹。
+      const place = React.useCallback(() => {
+        const el = triggerRef.current
+        if (!el) return
+        const rect = el.getBoundingClientRect()
+        const gap = 6
+        const MENU_PREF = 380
+        const below = window.innerHeight - rect.bottom
+        const above = rect.top
+        const flipUp = below < Math.min(MENU_PREF, 200) && above > below
+        const room = Math.max(120, (flipUp ? above : below) - gap * 2)
+        const top = flipUp ? Math.max(gap, rect.top - gap) : rect.bottom + gap
+        setAnchor({
+          position: 'fixed',
+          top,
+          left: Math.max(8, Math.min(rect.left, window.innerWidth - 368)),
+          maxHeight: Math.min(room, 420),
+          // 向上弹时用 bottom 定位，避免高度未知导致的偏移
+          ...(flipUp ? { top: 'auto', bottom: window.innerHeight - rect.top + gap } : {}),
+        })
+      }, [])
+
+      // useLayoutEffect：在绘制前算好坐标，避免首帧闪现到左上角。
+      React.useLayoutEffect(() => {
+        if (!open) return
+        place()
+        const onScrollOrResize = () => place()
+        window.addEventListener('resize', onScrollOrResize)
+        // capture=true：composer 内部滚动也能收到
+        window.addEventListener('scroll', onScrollOrResize, true)
+        return () => {
+          window.removeEventListener('resize', onScrollOrResize)
+          window.removeEventListener('scroll', onScrollOrResize, true)
+        }
+      }, [open, place])
+
+      React.useEffect(() => {
+        if (!selectorRpc) return
+        // 挂载时拉一次开关快照（设置页可能从未打开过）。
+        selectorRpc.snapshot().then((s) => setSwitchState(s)).catch(() => {})
+        const fn = () => force((n) => n + 1)
+        windowListeners.add(fn)
+        return () => windowListeners.delete(fn)
+      }, [])
+
+      React.useEffect(() => {
+        if (open) load()
+      }, [open, load])
+
+      React.useEffect(() => {
+        if (!open) return
+        const onDoc = (e) => {
+          // 菜单已 portal 到 body，两个容器都要判
+          if (rootRef.current?.contains(e.target)) return
+          if (menuRef.current?.contains(e.target)) return
+          setOpen(false)
+        }
+        document.addEventListener('mousedown', onDoc)
+        return () => document.removeEventListener('mousedown', onDoc)
+      }, [open])
+
+      const groups = state?.groups || []
+      const current = state?.current
+      const status = state?.status
+
+      // 打开后为可见模型补齐上下文窗口长度。
+      React.useEffect(() => {
+        if (!selectorRpc || !open) return
+        for (const g of groups) {
+          for (const m of g.models) {
+            const key = `${g.id}\n${m.id}`
+            if (windowCache.has(key) || windowPending.has(key)) continue
+            windowPending.add(key)
+            selectorRpc.contextWindowFor(g.id, m.id).then((v) => {
+              windowCache.set(key, v)
+              windowPending.delete(key)
+              for (const l of windowListeners) l()
+            }).catch(() => { windowPending.delete(key) })
+          }
+        }
+      }, [groups, open])
+
+      if (!available) return null
+
+      const currentName = current
+        ? (groups.find((g) => g.id === current.provider)?.models.find((m) => m.id === current.model)?.name)
+          || current.model
+        : null
+
+      const choose = (g, m) => {
+        const selection = {
+          provider: g.id,
+          model: m.id,
+          ...(m.reasoning?.defaultEffort !== undefined ? { reasoningEffort: m.reasoning.defaultEffort } : {}),
+        }
+        setOpen(false)
+        if (select) Promise.resolve(select(selection)).catch(() => {})
+      }
+
+      const trigger = E('button', {
+        type: 'button',
+        className: 'dmps-sel-trigger',
+        disabled: !!locked,
+        ref: triggerRef,
+        'aria-haspopup': 'menu',
+        'aria-expanded': String(open),
+        'aria-label': tt('selectModel'),
+        onClick: () => setOpen((v) => !v),
+      },
+        E('span', { className: 'dmps-sel-name' }, currentName || tt('selectModel')),
+        E('span', { className: 'dmps-sel-caret' }, open ? '▲' : '▼'))
+
+      const shell = E('div', { className: 'dmps-sel', ref: rootRef }, trigger)
+      if (!open) return shell
+
+      const menuBody = groups.length === 0
+        ? E('div', { className: 'dmps-sel-empty' }, status === 'loading' ? tt('loading') : tt('noModels'))
+        : groups.map((g) => E('div', { className: 'dmps-sel-group', key: g.id },
+            E('div', { className: 'dmps-sel-group-title' }, g.name),
+            g.models.map((m) => {
+              const win = windowCache.get(`${g.id}\n${m.id}`)
+              const sel = current && current.provider === g.id && current.model === m.id
+              return E('button', {
+                type: 'button',
+                className: 'dmps-sel-item',
+                'data-selected': String(!!sel),
+                role: 'menuitemradio',
+                'aria-checked': String(!!sel),
+                key: m.id,
+                onClick: () => choose(g, m),
+              },
+                E('span', { className: 'dmps-sel-item-name' }, m.name),
+                typeof win === 'number' && win > 0
+                  ? E('span', { className: 'dmps-ctx-window', title: `${tt('ctxWindow')}: ${win.toLocaleString()} tokens` }, formatWindow(win))
+                  : null,
+                sel ? E('span', { className: 'dmps-sel-check' }, '✓') : null)
+            }),
+          ))
+
+      // portal 到 body：composer 有包含块，留在原地会被裁切/撑开页面。
+      const menu = E('div', {
+        className: 'dmps-sel-menu',
+        ref: menuRef,
+        role: 'menu',
+        style: anchor || { position: 'fixed', top: 0, left: 0, visibility: 'hidden' },
+      }, menuBody)
+
+      const host = typeof document !== 'undefined' ? document.body : null
+      return E('div', { className: 'dmps-sel', ref: rootRef },
+        trigger,
+        host && typeof ReactDOM !== 'undefined' && ReactDOM.createPortal
+          ? ReactDOM.createPortal(menu, host)
+          : menu)
+    }
+
     /* ============================== 导航图标 ============================== */
 
     // 设置左侧导航行的图标（settings.section.icon，按分节 id 匹配）。
@@ -502,7 +803,7 @@ window.__ModuleLoader__.load({
     /* ============================== 注册 ============================== */
 
     return {
-      inject: ['slots', 'remote'],
+      inject: ['slots', 'remote', 'locale'],
       async apply(ctx) {
         ensureStyle()
         ctx.effect(() => removeStyle, 'provider-power-switch style cleanup')
@@ -535,6 +836,8 @@ window.__ModuleLoader__.load({
         // 3) 无论 RPC 成败，分节都必须注册（红字降级而非整块消失）。
         const slots = ctx.get('slots')
         if (!slots || typeof slots.register !== 'function') return
+        try { ctxLocale = ctx.get('locale') } catch { ctxLocale = null }
+        selectorRpc = makeRpc(face)
 
         slots.inject('settings.section', () => {
           try {
@@ -566,11 +869,63 @@ window.__ModuleLoader__.load({
           }
         })
 
+        // 4) 模型选择器：包一层宿主选择器，隐藏已停用模型 + 显示上下文窗口。
+        // 通过 ctx.inject 显式声明 modelDirectories（未进 inspect 目录的真实服务，
+        // 宿主选择器和 neartoken 都在用），拿到按会话的目录解析器。
+        const seatDispose = tryInjectSelectorSeat(ctx, slots)
+        if (seatDispose) ctx.effect(() => seatDispose, 'provider-power-switch model seat cleanup')
+
         // 上面那条注册只对「读取该座位」的宿主有效。宿主不读时（实测 dsh-tauri-ui）
         // 它静默无效，所以再挂一层 DOM 兜底；两者互不冲突——宿主自己画出我们的
         // 四芒星时，兜底会主动让位。
         installNavIconStandIn(ctx)
       },
+    }
+
+    /**
+     * 注册 conversation.input.model 座位：优先级 -2（宿主 0、neartoken/workbuddy -1），
+     * 不传 children（子槽已由宿主声明，重复声明会抛 already declared）。
+     * inject 返回的 directory 是我们过滤后的 store；组件委托宿主自带的选择器。
+     */
+    function tryInjectSelectorSeat(ctx, slots) {
+      const install = (scope) => {
+        const models = scope?.modelDirectories
+        const sessions = scope?.sessions
+        if (!models || typeof models.directoryFor !== 'function'
+          || !sessions || typeof sessions.subagentAddress !== 'function') {
+          console.warn('[dsh-provider-power-switch] model seat skipped: modelDirectories/sessions unavailable')
+          return
+        }
+        try {
+          // slots.inject 自己管理声明生命周期（collapse/re-mount 自动重跑 callback），
+          // 里面 slots.register 的 disposer 由该 effect 自动回收，无需额外持有。
+          slots.inject(SEAT, () => slots.register({
+            name: SEAT,
+            priority: -2,
+            inject: (sessionId) => {
+              const directory = models.directoryFor(sessionId)
+              const available = sessions.subagentAddress(sessionId) === void 0
+              const filtered = makeFilteredDirectory(directory.store)
+              return {
+                available,
+                directory: filtered,
+                load: () => { if (available) directory.load().catch(() => {}) },
+                resolveText: (text) => {
+                  try { return ctxLocale?.resolveText?.(text) ?? text } catch { return text }
+                },
+                select: (selection) => available ? directory.select(selection) : Promise.resolve(void 0),
+              }
+            },
+          }, FilteredModelSelect))
+        } catch (e) {
+          console.warn('[dsh-provider-power-switch] model seat register failed', e)
+        }
+      }
+      if (typeof ctx.inject === 'function') {
+        return ctx.inject(['slots', 'modelDirectories', 'sessions'], install)
+      }
+      console.warn('[dsh-provider-power-switch] ctx.inject unavailable, model seat not installed')
+      return undefined
     }
 
     function makeRpc(face) {
@@ -597,6 +952,11 @@ window.__ModuleLoader__.load({
         async setAll(providers, off) {
           if (!face.rpcFace?.setAll) throw noFace('setAll')
           return unwrap(await face.rpcFace.setAll(providers, off))
+        },
+        async contextWindowFor(provider, model) {
+          if (!face.rpcFace?.contextWindowFor) return null
+          const r = unwrap(await face.rpcFace.contextWindowFor(provider, model))
+          return typeof r === 'number' && Number.isFinite(r) && r > 0 ? r : null
         },
       }
     }

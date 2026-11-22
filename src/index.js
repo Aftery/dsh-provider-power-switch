@@ -65,6 +65,13 @@ function statePath() {
   return cachedPath
 }
 
+/**
+ * 精确模型上下文窗口长度的进程内缓存：provider/model 键 → number | null。
+ * null 表示「适配器没给 / 查询失败」，也会缓存，避免选择器每次打开都重新问。
+ * pending:<key> 存的是正在进行的 Promise，供并发调用去重。
+ */
+const contextWindowCache = new Map()
+
 /** 进程内权威状态：被关闭的 provider/model 键集合。 */
 const disabled = new Set()
 /**
@@ -351,6 +358,40 @@ class ModelSwitchService extends TypertRemoteService {
     return listModelGroups()
   }
 
+  /**
+   * 精确模型的上下文窗口长度（tokens），供客户端选择器行尾显示。
+   * 只走 llm.resolveModelInfo 的 context 字段；取不到就返回 null，绝不猜数字。
+   * 结果按 provider/model 在进程内缓存：适配器查询可能很贵，且窗口长度不会频繁变。
+   */
+  async contextWindowFor(provider, model) {
+    if (typeof provider !== 'string' || !provider
+      || typeof model !== 'string' || !model) return null
+    const llm = llmBridge
+    if (!llm || typeof llm.resolveModelInfo !== 'function') return null
+    const k = makeKey(provider, model)
+    if (contextWindowCache.has(k)) return contextWindowCache.get(k)
+    const pending = contextWindowCache.get(`pending:${k}`)
+    if (pending) return pending
+    const task = (async () => {
+      try {
+        const info = await llm.resolveModelInfo(provider, model)
+        const n = info?.context?.contextWindow
+        const value = typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : null
+        contextWindowCache.set(k, value)
+        return value
+      } catch (e) {
+        ctxLogger?.debug?.('[provider-power-switch] contextWindowFor failed for %s/%s: %s', provider, model, e?.message)
+        // 失败不长期缓存为 null：适配器可能稍后才准备好；但缓存一个短期 null 防止抖动。
+        contextWindowCache.set(k, null)
+        return null
+      } finally {
+        contextWindowCache.delete(`pending:${k}`)
+      }
+    })()
+    contextWindowCache.set(`pending:${k}`, task)
+    return task
+  }
+
   /** 旧接口兼容：活跃 provider id 列表。 */
   listProviders() {
     const providers = []
@@ -430,6 +471,7 @@ class ModelSwitchService extends TypertRemoteService {
 
 markRemoteMethods(ModelSwitchService.prototype, [
   'snapshot', 'listModels', 'listProviders', 'setModel', 'setGroup', 'setProvider', 'setAll',
+  'contextWindowFor',
 ])
 
 /* ============================== 插件入口 ============================== */
@@ -487,6 +529,12 @@ export function apply(ctx) {
     }
     return next()
   }), 'provider-power-switch llm/stream middleware')
+
+  // 适配器/模型目录变化时清掉窗口长度缓存，避免陈旧容量显示到下次重启。
+  for (const event of ['llm/adapters-updated', 'llm/models-updated']) {
+    ctx.effect(() => ctx.on(event, () => { contextWindowCache.clear() }),
+      `provider-power-switch context cache invalidation on ${event}`)
+  }
 
   // ---- RPC 服务 ----
   ctx.effect(() => ctx.plugin(ModelSwitchService), 'provider-power-switch rpc service')

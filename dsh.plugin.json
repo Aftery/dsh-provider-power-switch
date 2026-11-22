@@ -1,8 +1,8 @@
 {
   "id": "dsh-community/dsh-provider-power-switch",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "main": "./src/index.js",
-  "description": "按供应商分组的模型开关：在「设置 → 模型开关」分节给每个模型一行启用/停用开关，支持搜索与整组开关。",
+  "description": "按供应商分组的模型开关：在「设置 → 模型开关」分节给每个模型一行启用/停用开关，支持搜索与整组开关；关闭的模型同时从 composer 模型选择器隐藏，选择器显示每个模型的上下文窗口长度。",
   "engines": {
     "dsh": ">=0.2.0-rc.2 <0.3.0"
   },

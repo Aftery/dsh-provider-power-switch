@@ -72,6 +72,8 @@ check('factory is function', () => { if (typeof loaded.factory !== 'function') t
 
 const requireStub = (name) => {
   if (name === 'react') return React
+  // 选择器把菜单 portal 到 body；测试里 createPortal 退化成直接返回子节点。
+  if (name === 'react-dom') return { createPortal: (node) => node }
   throw new Error('unexpected require: ' + name)
 }
 const plugin = loaded.factory(requireStub)

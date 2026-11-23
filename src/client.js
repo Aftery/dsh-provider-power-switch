@@ -249,6 +249,68 @@ window.__ModuleLoader__.load({
       }, E('span', { className: 'dmps-knob' }))
     }
 
+    /**
+     * 单个模型是否关闭（纯函数，服务端/设置页/选择器同一套优先级）：
+     * 例外（整组关后又单独开的）优先于通配符，通配符优先于精确键。
+     */
+    function modelOffFrom(disabledList, exceptionList, provider, model) {
+      if ((exceptionList || []).some((e) => e.provider === provider && e.model === model)) return false
+      return (disabledList || []).some(
+        (d) => d.provider === provider && (d.model === model || d.model === '*'),
+      )
+    }
+
+    /** 整组状态灯：on 全开 / partial 部分停用 / off 全停 / idle 无模型。 */
+    function groupStatusFrom(disabledList, exceptionList, group) {
+      const models = (group && group.models) || []
+      if (models.length === 0) {
+        const wildcard = (disabledList || []).some(
+          (d) => d.provider === group.provider && d.model === '*',
+        )
+        return wildcard ? 'off' : 'idle'
+      }
+      const off = models.filter((m) => modelOffFrom(disabledList, exceptionList, group.provider, m.id)).length
+      if (off === 0) return 'on'
+      return off === models.length ? 'off' : 'partial'
+    }
+
+    /**
+     * 默认折叠规则：整组模型全部关闭 → 默认收起，其余展开。
+     * 一键「全部关闭」之后满屏都是躺平的组，按默认收起后整页只剩
+     * 供应商名 + 状态灯 + 计数，需要时再点开。
+     */
+    function groupOpenByDefault(status) {
+      return status !== 'off'
+    }
+
+    /**
+     * 用户手点过的折叠选择只在「点下去那一刻的整组状态灯」下有效；
+     * 状态变了（例如刚被整组停用、又重新启用）旧选择就作废，回到默认规则，
+     * 这样「全部关闭」后该组一定听话地收起，不用逐组再点一次。
+     * choice = { open, status }
+     */
+    function groupOpenFromChoice(choice, status) {
+      if (!choice || choice.status !== status) return groupOpenByDefault(status)
+      return choice.open === true
+    }
+
+    /**
+     * 清掉因为状态变化而失效的手点记录。
+     * 单看 status 相等还不够：on → off → on 会让状态回到同一个值，旧记录
+     * 就会诈尸。所以状态一变就把它删掉，谁也别想记住两个状态之前的意图。
+     */
+    function pruneFoldChoices(choices, groups, disabledList, exceptionList) {
+      const next = {}
+      let changed = false
+      for (const [provider, choice] of Object.entries(choices || {})) {
+        const group = (groups || []).find((g) => g.provider === provider)
+        if (!group || !choice) { changed = true; continue }
+        if (groupStatusFrom(disabledList, exceptionList, group) !== choice.status) { changed = true; continue }
+        next[provider] = choice
+      }
+      return changed ? next : choices
+    }
+
     function ModelSwitchPanel({ rpc }) {
       const [groups, setGroups] = React.useState(null)
       const [disabled, setDisabled] = React.useState([])
@@ -256,12 +318,25 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = React.useState(false)
       const [failure, setFailure] = React.useState('')
       const [query, setQuery] = React.useState('')
-      const [collapsed, setCollapsed] = React.useState(() => [])
+      // 折叠状态只记「用户亲手点过的那一下」：provider → { open, status }，
+      // status 是点下去那一刻该组的状态灯值（on/partial/off）。
+      // 状态一旦变了（例如刚被整组停用），旧选择就作废，回到默认规则。
+      const [foldChoice, setFoldChoice] = React.useState(() => ({}))
 
-      const isCollapsed = (provider) => collapsed.includes(provider)
-      const toggleGroup = (provider) => setCollapsed((prev) => (
-        prev.includes(provider) ? prev.filter((p) => p !== provider) : [...prev, provider]
-      ))
+      const isGroupOpen = (provider, status) => (
+        groupOpenFromChoice(foldChoice[provider], status)
+      )
+      const toggleGroup = (provider, status) => setFoldChoice((prev) => ({
+        ...prev,
+        [provider]: { open: !isGroupOpen(provider, status), status },
+      }))
+
+      // 组的状态一变，旧的手点记录立即作废：否则「全关时手点展开」会留到
+      // 下一次全关，把本该默认收起的组又撑开。这里只做清理，不改折叠结果。
+      React.useEffect(() => {
+        if (!Array.isArray(groups)) return
+        setFoldChoice((prev) => pruneFoldChoices(prev, groups, disabled, exceptions))
+      }, [groups, disabled, exceptions])
 
       const refresh = React.useCallback(async () => {
         try {
@@ -301,24 +376,9 @@ window.__ModuleLoader__.load({
       }
 
       // 单个模型是否关闭：与服务端同一套优先级——例外（整组关后单独开的）优先于通配符。
-      const isModelOff = (provider, model) => {
-        if (exceptions.some((e) => e.provider === provider && e.model === model)) return false
-        return disabled.some(
-          (d) => d.provider === provider && (d.model === model || d.model === '*'),
-        )
-      }
-      const isGroupOff = (provider) => disabled.some(
-        (d) => d.provider === provider && d.model === '*',
-      )
+      const isModelOff = (provider, model) => modelOffFrom(disabled, exceptions, provider, model)
       // 折叠状态下靠这盏灯判断整组：全开绿 / 有关橙 / 全关红
-      const groupStatus = (g) => {
-        const total = g.models.length
-        if (!total) return isGroupOff(g.provider) ? 'off' : 'idle'
-        const off = g.models.filter((m) => isModelOff(g.provider, m.id)).length
-        if (off === 0) return 'on'
-        if (off === total) return 'off'
-        return 'partial'
-      }
+      const groupStatus = (g) => groupStatusFrom(disabled, exceptions, g)
       // 有关闭的模型时，计数改成「启用数/总数」，折叠时也能读出规模
       const groupCountLabel = (g) => {
         const total = g.models.length
@@ -374,10 +434,10 @@ window.__ModuleLoader__.load({
             ? E('p', { className: 'dmps-empty' }, t('noMatch'))
             : E('div', { className: 'dmps-groups' },
                 filtered.map((g) => {
-                  // 搜索时忽略折叠状态，保证命中项一定可见
-                  const open = q ? true : !isCollapsed(g.provider)
                   // 状态灯始终按整组模型统计，不受搜索过滤影响
                   const status = groupStatus(groups.find((x) => x.provider === g.provider) || g)
+                  // 搜索时忽略折叠状态，保证命中项一定可见
+                  const open = q ? true : isGroupOpen(g.provider, status)
                   return E('section', { className: 'dmps-group', key: g.provider },
                     E('div', { className: 'dmps-group-head' },
                       E('button', {
@@ -387,7 +447,7 @@ window.__ModuleLoader__.load({
                         'aria-label': `${open ? t('collapse') : t('expand')}: ${g.displayName} · ${t('status_' + status)}`,
                         title: open ? t('collapse') : t('expand'),
                         disabled: busy,
-                        onClick: () => toggleGroup(g.provider),
+                        onClick: () => toggleGroup(g.provider, status),
                       }, E('span', { className: 'dmps-caret' }),
                         E('span', {
                           className: 'dmps-dot',

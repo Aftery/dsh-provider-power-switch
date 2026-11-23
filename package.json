@@ -2,6 +2,14 @@
   "name": "dsh-provider-power-switch",
   "version": "0.5.0",
   "description": "按供应商分组的模型开关：在「设置 → 模型开关」分节给每个模型一行启用/停用开关，支持搜索与整组开关，模型全部关闭的供应商默认折叠；关闭后立即拦截发往该模型的请求（不消耗配额），并把它从 composer 的模型选择器里隐藏，选择器同时显示每个模型的上下文窗口长度。Per-model switches grouped by provider in the \"Model switches\" settings section; disabled models are intercepted before any real request is sent, hidden from the composer model picker, and each model row shows its context-window size.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Aftery/dsh-provider-power-switch.git"
+  },
+  "homepage": "https://github.com/Aftery/dsh-provider-power-switch#readme",
+  "bugs": {
+    "url": "https://github.com/Aftery/dsh-provider-power-switch/issues"
+  },
   "type": "module",
   "main": "./src/index.js",
   "exports": {
@@ -18,7 +26,8 @@
     "icon.svg",
     "README.md",
     "LICENSE",
-    "tests/"
+    "tests/",
+    "assets/"
   ],
   "engines": {
     "node": ">=18",
